@@ -1,11 +1,14 @@
 package com.korzen.wysylacz;
 
 import android.app.Activity;
+import android.app.PendingIntent;
 import android.content.ClipData;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.pm.PackageInstaller;
 import android.database.Cursor;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.provider.OpenableColumns;
 import android.view.Gravity;
@@ -35,6 +38,9 @@ public class MainActivity extends Activity {
     private ProgressBar bar;
     private SharedPreferences prefs;
     private volatile boolean busy;
+
+    private static final String ACTION_INSTALL = "com.korzen.wysylacz.INSTALL_STATUS";
+    private static final String REPO = "korzen551/wyslij-na-pc";
 
     @Override
     protected void onCreate(Bundle b) {
@@ -86,7 +92,13 @@ public class MainActivity extends Activity {
         log.setPadding(0, p, 0, 0);
         ScrollView scroll = new ScrollView(this);
         scroll.addView(log);
-        root.addView(scroll);
+        root.addView(scroll, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+
+        Button update = new Button(this);
+        update.setText("Sprawdź aktualizację (masz wersję " + myVersion() + ")");
+        update.setOnClickListener(v -> checkUpdate());
+        root.addView(update);
 
         setContentView(root);
         handleShare(getIntent());
@@ -101,6 +113,17 @@ public class MainActivity extends Activity {
     /** Pliki przyslane przez "Udostepnij" z galerii albo innej apki. */
     private void handleShare(Intent in) {
         if (in == null || in.getAction() == null) return;
+        if (ACTION_INSTALL.equals(in.getAction())) {
+            int st = in.getIntExtra(PackageInstaller.EXTRA_STATUS, PackageInstaller.STATUS_FAILURE);
+            if (st == PackageInstaller.STATUS_PENDING_USER_ACTION) {
+                Intent confirm = in.getParcelableExtra(Intent.EXTRA_INTENT);
+                if (confirm != null) startActivity(confirm);
+            } else if (st != PackageInstaller.STATUS_SUCCESS) {
+                status.setText("Aktualizacja nieudana: "
+                        + in.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE));
+            }
+            return;
+        }
         List<Uri> uris = new ArrayList<>();
         if (Intent.ACTION_SEND.equals(in.getAction())) {
             Uri u = in.getParcelableExtra(Intent.EXTRA_STREAM);
@@ -213,6 +236,92 @@ public class MainActivity extends Activity {
         } finally {
             c.disconnect();
         }
+    }
+
+    private String myVersion() {
+        try {
+            return getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
+        } catch (Exception e) {
+            return "0";
+        }
+    }
+
+    private static int num(String s) {
+        try {
+            return Integer.parseInt(s.replaceAll("\\D", ""));
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
+    /** Czy wersja a jest nowsza niz b (np. 1.10 > 1.9). */
+    private static boolean newer(String a, String b) {
+        String[] x = a.split("\\."), y = b.split("\\.");
+        for (int i = 0; i < Math.max(x.length, y.length); i++) {
+            int p = i < x.length ? num(x[i]) : 0, q = i < y.length ? num(y[i]) : 0;
+            if (p != q) return p > q;
+        }
+        return false;
+    }
+
+    private void setStatus(final String s) {
+        runOnUiThread(() -> status.setText(s));
+    }
+
+    /** Pyta GitHuba o najnowsze wydanie; jesli jest nowsze, pobiera je i odpala instalator. */
+    private void checkUpdate() {
+        if (busy) {
+            Toast.makeText(this, "Poczekaj, trwa wysyłanie", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        busy = true;
+        status.setText("Sprawdzam aktualizację...");
+        new Thread(() -> {
+            try {
+                HttpURLConnection c = (HttpURLConnection) new URL(
+                        "https://api.github.com/repos/" + REPO + "/releases/latest").openConnection();
+                c.setConnectTimeout(8000);
+                c.setReadTimeout(15000);
+                c.setRequestProperty("Accept", "application/vnd.github+json");
+                java.io.ByteArrayOutputStream json = new java.io.ByteArrayOutputStream();
+                byte[] buf = new byte[1 << 16];
+                int n;
+                try (InputStream in = c.getInputStream()) {
+                    while ((n = in.read(buf)) > 0) json.write(buf, 0, n);
+                }
+                String latest = new org.json.JSONObject(json.toString("UTF-8"))
+                        .getString("tag_name").replaceFirst("^v", "");
+                if (!newer(latest, myVersion())) {
+                    setStatus("Masz najnowszą wersję (" + myVersion() + ")");
+                    return;
+                }
+                setStatus("Pobieram wersję " + latest + "...");
+                HttpURLConnection d = (HttpURLConnection) new URL(
+                        "https://github.com/" + REPO + "/releases/download/v" + latest + "/wysylacz.apk")
+                        .openConnection();
+                d.setConnectTimeout(8000);
+                d.setReadTimeout(30000);
+                PackageInstaller pi = getPackageManager().getPackageInstaller();
+                int id = pi.createSession(new PackageInstaller.SessionParams(
+                        PackageInstaller.SessionParams.MODE_FULL_INSTALL));
+                try (PackageInstaller.Session s = pi.openSession(id)) {
+                    try (InputStream in = d.getInputStream();
+                         OutputStream out = s.openWrite("apk", 0, -1)) {
+                        while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+                        s.fsync(out);
+                    }
+                    Intent cb = new Intent(this, MainActivity.class).setAction(ACTION_INSTALL);
+                    int flags = PendingIntent.FLAG_UPDATE_CURRENT
+                            | (Build.VERSION.SDK_INT >= 31 ? PendingIntent.FLAG_MUTABLE : 0);
+                    s.commit(PendingIntent.getActivity(this, 0, cb, flags).getIntentSender());
+                }
+                setStatus("Potwierdź instalację wersji " + latest);
+            } catch (Exception e) {
+                setStatus("Nie udało się sprawdzić aktualizacji: " + e.getMessage());
+            } finally {
+                busy = false;
+            }
+        }).start();
     }
 
     private static String mb(long bytes) {
