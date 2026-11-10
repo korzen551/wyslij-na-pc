@@ -22,6 +22,7 @@ APK = HERE.parent / "wysylacz" / "build" / "wysylacz.apk"
 TAILSCALE = r"C:\Program Files\Tailscale\tailscale.exe"
 PORT = 8765
 BUF = 1 << 20
+CREATE_LOCK = threading.Lock()
 
 
 def say(*a) -> None:
@@ -97,11 +98,55 @@ class Handler(BaseHTTPRequestHandler):
             total += len(chunk)
         return total
 
+    def finish(self, total: int, name: str) -> None:
+        line = f"{datetime.datetime.now():%Y-%m-%d %H:%M:%S}\t{total}\t{name}"
+        with open(INBOX / "_log.txt", "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+        say("ODEBRANO", line)
+        self.reply(200, "ok")
+
+    def tmp_for(self) -> Path | None:
+        """Plik tymczasowy dla wysylki w kawalkach; id nadaje apka."""
+        tid = self.headers.get("X-Id") or ""
+        return INBOX / f".{tid}.part" if re.fullmatch(r"[0-9a-f]{8,40}", tid) else None
+
+    def do_part(self) -> None:
+        """Jeden kawalek pliku, zapisywany pod wskazanym przesunieciem. Kawalki ida rownolegle."""
+        tmp = self.tmp_for()
+        if tmp is None:
+            self.close_connection = True
+            return self.reply(400, "zle id")
+        try:
+            with CREATE_LOCK:
+                if not tmp.exists():
+                    tmp.touch()
+            with open(tmp, "r+b") as out:
+                out.seek(int(self.headers.get("X-Offset") or 0))
+                self.read_body(out)
+        except Exception as e:
+            self.close_connection = True
+            say("BLAD kawalka", e)
+            return
+        self.reply(200, "ok")
+
+    def do_done(self) -> None:
+        tmp = self.tmp_for()
+        total = int(self.headers.get("X-Total") or -1)
+        if tmp is None or not tmp.exists() or tmp.stat().st_size != total:
+            return self.reply(409, "plik niekompletny")
+        dest = free_path(safe_name(self.headers.get("X-Filename")))
+        tmp.rename(dest)
+        self.finish(total, dest.name)
+
     def do_POST(self):
+        INBOX.mkdir(exist_ok=True)
+        if self.path == "/part":
+            return self.do_part()
+        if self.path == "/done":
+            return self.do_done()
         if self.path != "/upload":
             self.close_connection = True
             return self.reply(404, "nie ma")
-        INBOX.mkdir(exist_ok=True)
         dest = free_path(safe_name(self.headers.get("X-Filename")))
         part = dest.with_name(dest.name + ".part")
         try:
@@ -113,11 +158,7 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
             say("BLAD", dest.name, e)
             return
-        line = f"{datetime.datetime.now():%Y-%m-%d %H:%M:%S}\t{total}\t{dest.name}"
-        with open(INBOX / "_log.txt", "a", encoding="utf-8") as f:
-            f.write(line + "\n")
-        say("ODEBRANO", line)
-        self.reply(200, "ok")
+        self.finish(total, dest.name)
 
 
 def tailscale_ip() -> str | None:

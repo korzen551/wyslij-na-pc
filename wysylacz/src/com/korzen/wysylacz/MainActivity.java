@@ -170,7 +170,10 @@ public class MainActivity extends Activity {
                 try {
                     long[] size = {-1};
                     name = describe(uris.get(i), size);
-                    upload(h, uris.get(i), name, size[0], (i + 1) + "/" + uris.size());
+                    String which = (i + 1) + "/" + uris.size();
+                    if (size[0] < FAST_MIN || !uploadFast(h, uris.get(i), name, size[0], which)) {
+                        upload(h, uris.get(i), name, size[0], which);
+                    }
                     ok++;
                     say("✔ " + name + " (" + mb(size[0]) + ")");
                 } catch (Exception e) {
@@ -236,6 +239,138 @@ public class MainActivity extends Activity {
         } finally {
             c.disconnect();
         }
+    }
+
+    private static final long FAST_MIN = 8L << 20;   // mniejsze pliki ida jednym strumieniem
+    private static final int PART = 4 << 20;         // rozmiar kawalka
+    private static final int STREAMS = 6;            // ile kawalkow naraz
+
+    private HttpURLConnection post(String h, String path, String id, String name, long total) throws Exception {
+        HttpURLConnection c = (HttpURLConnection) new URL("http://" + h + path).openConnection();
+        c.setConnectTimeout(8000);
+        c.setReadTimeout(60000);
+        c.setDoOutput(true);
+        c.setRequestMethod("POST");
+        c.setRequestProperty("X-Id", id);
+        c.setRequestProperty("X-Total", String.valueOf(total));
+        c.setRequestProperty("X-Filename", URLEncoder.encode(name, "UTF-8").replace("+", "%20"));
+        c.setRequestProperty("Content-Type", "application/octet-stream");
+        return c;
+    }
+
+    /**
+     * Szybka wysylka: plik idzie w kawalkach kilkoma polaczeniami naraz, co na sieci
+     * komorkowej daje duzo wiekszy transfer niz jedno polaczenie. Zwraca false, gdy
+     * pliku nie da sie czytac od dowolnego miejsca; wtedy leci zwykla wysylka.
+     */
+    private boolean uploadFast(String h, Uri uri, String name, long size, String which) throws Exception {
+        final android.os.ParcelFileDescriptor pfd;
+        try {
+            pfd = getContentResolver().openFileDescriptor(uri, "r");
+        } catch (Exception e) {
+            return false;
+        }
+        if (pfd == null) return false;
+        final String id = Long.toHexString(System.nanoTime()) + Long.toHexString(new java.util.Random().nextLong() | 1L << 62);
+        final java.util.concurrent.atomic.AtomicLong next = new java.util.concurrent.atomic.AtomicLong(0);
+        final java.util.concurrent.atomic.AtomicLong sent = new java.util.concurrent.atomic.AtomicLong(0);
+        final Exception[] failed = {null};
+        try (java.io.FileInputStream fis = new java.io.FileInputStream(pfd.getFileDescriptor())) {
+            final java.nio.channels.FileChannel ch = fis.getChannel();
+            try {
+                ch.read(java.nio.ByteBuffer.allocate(1), 0);  // czy da sie czytac od dowolnego miejsca
+            } catch (Exception e) {
+                return false;
+            }
+            Thread[] workers = new Thread[STREAMS];
+            for (int w = 0; w < STREAMS; w++) {
+                workers[w] = new Thread(() -> {
+                    byte[] buf = new byte[PART];
+                    while (failed[0] == null) {
+                        long off = next.getAndAdd(PART);
+                        if (off >= size) return;
+                        int len = (int) Math.min(PART, size - off);
+                        try {
+                            java.nio.ByteBuffer bb = java.nio.ByteBuffer.wrap(buf, 0, len);
+                            long pos = off;
+                            while (bb.hasRemaining()) {
+                                int n = ch.read(bb, pos);
+                                if (n < 0) throw new Exception("plik krótszy niż podano");
+                                pos += n;
+                            }
+                            sendPart(h, id, name, size, off, buf, len, sent);
+                        } catch (Exception e) {
+                            failed[0] = e;
+                        }
+                    }
+                });
+                workers[w].start();
+            }
+            long start = System.currentTimeMillis();
+            boolean alive = true;
+            while (alive) {
+                alive = false;
+                for (Thread t : workers) {
+                    t.join(60);
+                    alive |= t.isAlive();
+                }
+                final long fs = Math.min(sent.get(), size);
+                final double secs = Math.max(0.2, (System.currentTimeMillis() - start) / 1000.0);
+                runOnUiThread(() -> {
+                    status.setText(which + "  " + name + "\n" + mb(fs) + " / " + mb(size)
+                            + String.format(Locale.US, "   %.1f MB/s", fs / 1048576.0 / secs));
+                    bar.setProgress((int) (fs * 1000 / size));
+                });
+            }
+        } finally {
+            pfd.close();
+        }
+        if (failed[0] != null) throw failed[0];
+        HttpURLConnection c = post(h, "/done", id, name, size);
+        try {
+            c.setFixedLengthStreamingMode(0);
+            c.getOutputStream().close();
+            if (c.getResponseCode() != 200) throw new Exception("komputer odpowiedział " + c.getResponseCode());
+        } finally {
+            c.disconnect();
+        }
+        runOnUiThread(() -> bar.setProgress(1000));
+        return true;
+    }
+
+    /** Jeden kawalek; przy bledzie sieci probuje do trzech razy. */
+    private void sendPart(String h, String id, String name, long total, long off, byte[] buf, int len,
+                          java.util.concurrent.atomic.AtomicLong sent) throws Exception {
+        Exception last = null;
+        for (int attempt = 0; attempt < 3; attempt++) {
+            long counted = 0;
+            HttpURLConnection c = post(h, "/part", id, name, total);
+            try {
+                c.setRequestProperty("X-Offset", String.valueOf(off));
+                c.setFixedLengthStreamingMode(len);
+                try (OutputStream out = c.getOutputStream()) {
+                    for (int p = 0; p < len; p += 1 << 16) {
+                        int n = Math.min(1 << 16, len - p);
+                        out.write(buf, p, n);
+                        counted += n;
+                        sent.addAndGet(n);
+                    }
+                }
+                if (c.getResponseCode() == 200) {
+                    // Doczytanie odpowiedzi zostawia polaczenie otwarte dla nastepnego kawalka.
+                    try (InputStream in = c.getInputStream()) {
+                        while (in.read() >= 0) { /* nic */ }
+                    }
+                    return;
+                }
+                last = new Exception("komputer odpowiedział " + c.getResponseCode());
+            } catch (Exception e) {
+                last = e;
+            }
+            c.disconnect();
+            sent.addAndGet(-counted);  // kawalek pojdzie jeszcze raz
+        }
+        throw last;
     }
 
     private String myVersion() {
